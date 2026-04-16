@@ -135,6 +135,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Official docs: https://help.aliyun.com/zh/model-studio/developer-reference/
     "qwen3-coder-plus": 1000000,  # 1M context
     "qwen3-coder": 262144,        # 256K context
+    "qwen3.6-plus": 1000000,       # 1M context
     "qwen": 131072,
     # MiniMax — official docs: 204,800 context for all models
     # https://platform.minimax.io/docs/api-reference/text-anthropic-api
@@ -1114,3 +1115,72 @@ def estimate_request_tokens_rough(
     if tools:
         total_chars += len(str(tools))
     return (total_chars + 3) // 4
+
+# Known vision-capable model prefixes (lowercased). Any model whose
+# full name contains one of these substrings is assumed to natively
+# support image_url content blocks in the OpenAI Chat Completions API.
+VISION_CAPABLE_MODEL_PREFIXES = frozenset({
+    "vision",
+    "gpt-4o",
+    "gpt-4v",
+    "gpt-4turbo",   # some turbo variants support vision
+    "claude-3",     # Claude 3+ (via OpenRouter Anthropic compat)
+    "claude-3.5",
+    "claude-3.1",
+    "claude-sonnet-4",
+    "claude-opus-4",
+    "gemini-1.5",
+    "gemini-2",
+    "gemini-pro-vision",
+    "qwen-vl",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "llava",
+    "bakllava",
+    "llama-4",
+
+    "pixtral",
+    "molmo",
+    "grok-2-vision",
+})
+
+
+def model_supports_vision(model_name: str) -> bool:
+    """Return True if the model is known to natively support image content blocks."""
+    if not model_name:
+        return False
+    lowered = model_name.lower()
+    return any(prefix in lowered for prefix in VISION_CAPABLE_MODEL_PREFIXES)
+
+
+def encode_image_as_base64(image_path: "Path") -> str:
+    """Encode an image file as a base64 data URL."""
+    import base64
+    import re
+    from pathlib import Path
+
+    # Convert Windows paths to WSL paths (e.g. C:\Users\... -> /mnt/c/Users/...)
+    raw = str(image_path)
+    if re.match(r"^[A-Za-z]:[/\\]", raw):
+        drive = raw[0].lower()
+        wsl_path = f"/mnt/{drive}" + raw[2:].replace("\\", "/")
+        path = Path(wsl_path)
+    else:
+        path = Path(image_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    mime_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }
+    suffix = path.suffix.lower()
+    mime = mime_map.get(suffix, "image/jpeg")
+
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{data}"

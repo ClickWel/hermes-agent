@@ -159,6 +159,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
+    CommandDef("remove", "Remove the last attached image from the queue", "Info",
+               cli_only=True, aliases=("rm",)),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),

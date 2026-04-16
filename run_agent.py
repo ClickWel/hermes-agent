@@ -90,6 +90,7 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
+    model_supports_vision,
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -1354,11 +1355,21 @@ class AIAgent:
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
 
         # Read explicit context_length override from model config
-        _model_cfg = _agent_cfg.get("model", {})
-        if isinstance(_model_cfg, dict):
-            _config_context_length = _model_cfg.get("context_length")
-        else:
-            _config_context_length = None
+        # Priority: 1) agent.model_overrides.<model_name>.context_length (per-delegated-model)
+        #           2) agent.model.context_length (global override)
+        _agent_section = _agent_cfg.get("agent", {})
+        _model_cfg = _agent_cfg.get("model", {})  # Also needed at line 1387 for ollama_num_ctx
+        _config_context_length = None
+        # 1) Per-model override (used by delegation to allow small-context subagents)
+        _model_overrides = _agent_section.get("model_overrides", {})
+        if isinstance(_model_overrides, dict) and self.model:
+            _model_specific = _model_overrides.get(self.model, {})
+            if isinstance(_model_specific, dict):
+                _config_context_length = _model_specific.get("context_length")
+        # 2) Global model.context_length override
+        if _config_context_length is None:
+            if isinstance(_model_cfg, dict):
+                _config_context_length = _model_cfg.get("context_length")
         if _config_context_length is not None:
             try:
                 _config_context_length = int(_config_context_length)
@@ -1499,7 +1510,7 @@ class AIAgent:
         # for reliable tool-calling workflows (64K tokens).
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
         _ctx = getattr(self.context_compressor, "context_length", 0)
-        if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
+        if _config_context_length is None and _ctx < MINIMUM_CONTEXT_LENGTH:
             raise ValueError(
                 f"Model {self.model} has a context window of {_ctx:,} tokens, "
                 f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
@@ -6402,12 +6413,21 @@ class AIAgent:
         return "[A multimodal message was converted to text for Anthropic compatibility.]"
 
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+        # If the model supports vision natively, preserve image content blocks
+        # (they will be sent as-is to OpenAI/OpenRouter which handles them).
+        # Only strip to text for text-only models.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
             for msg in api_messages
         ):
             return api_messages
 
+        logging.info("vision check: model=%r supports=%r", self.model, model_supports_vision(self.model))
+        if model_supports_vision(self.model):
+            # Vision-capable model: preserve image content blocks
+            return api_messages
+
+        # Text-only model: convert images to text descriptions
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -7399,6 +7419,9 @@ class AIAgent:
                 toolsets=function_args.get("toolsets"),
                 tasks=function_args.get("tasks"),
                 max_iterations=function_args.get("max_iterations"),
+                acp_command=function_args.get("acp_command"),
+                acp_args=function_args.get("acp_args"),
+                model=function_args.get("model"),
                 parent_agent=self,
             )
         else:
@@ -7899,6 +7922,9 @@ class AIAgent:
                         toolsets=function_args.get("toolsets"),
                         tasks=tasks_arg,
                         max_iterations=function_args.get("max_iterations"),
+                        acp_command=function_args.get("acp_command"),
+                        acp_args=function_args.get("acp_args"),
+                        model=function_args.get("model"),
                         parent_agent=self,
                     )
                     _delegate_result = function_result
@@ -8236,7 +8262,7 @@ class AIAgent:
 
     def run_conversation(
         self,
-        user_message: str,
+        user_message: "str | list[dict]",
         system_message: str = None,
         conversation_history: List[Dict[str, Any]] = None,
         task_id: str = None,
@@ -8247,7 +8273,11 @@ class AIAgent:
         Run a complete conversation with tool calling until completion.
 
         Args:
-            user_message (str): The user's message/question
+            user_message (str | list[dict]): The user's message/question.
+                Can be a plain string or a multimodal content list
+                (OpenAI-style [{"type": "text", "text": "..."},
+                {"type": "image_url", "image_url": {"url": "data:..."}}])
+                for vision-capable models.
             system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
             conversation_history (List[Dict]): Previous conversation messages (optional)
             task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
@@ -8340,8 +8370,11 @@ class AIAgent:
         self.iteration_budget = IterationBudget(self.max_iterations)
 
         # Log conversation turn start for debugging/observability
-        _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
-        _msg_preview = _msg_preview.replace("\n", " ")
+        if isinstance(user_message, list):
+            _msg_preview = f"[multimodal: {len(user_message)} parts]"
+        else:
+            _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
+            _msg_preview = _msg_preview.replace("\n", " ")
         logger.info(
             "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
             self.session_id or "none", self.model, self.provider or "unknown",
